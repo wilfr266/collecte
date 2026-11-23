@@ -17,7 +17,7 @@ Chaque paiement identifie :
 
 ## Espèces
 
-1. Le collecteur (rôle `collector` + permission `payment.record`) déclare via `record_collection_payment_request` : paiement `pending`, montant plafonné au solde de l'obligation.
+1. Le collecteur (rôle `collector` + permission `payment.record`) déclare via `record_collection_payment_request` (écran Nouvelle visite → Avec demande de paiement) : paiement `pending`. Avec une échéance choisie, le montant est plafonné à son solde ; sans échéance (cas normal depuis la décision du 2026-10-27), la demande rejoint l'obligation « Encaissement » du jour de l'établissement et `refresh_field_obligation` recalcule son dû (en attente + confirmés) sans rien créditer.
 2. Doublons : la même clé d'idempotence renvoie le paiement existant ; une autre clé pour la même obligation, le même montant, le même mode et le même collecteur, encore `pending` et saisie depuis moins de 10 minutes, est refusée (`payments_prevent_duplicate`). Le déclencheur verrouille l'obligation : deux saisies simultanées sont sérialisées (isolation READ COMMITTED).
 3. Validation : un caissier affecté à une caisse ouverte appelle `confirm_cash_payment` → `confirmed`, mouvement de caisse, reçu, mise à jour du solde, audit.
 4. Rapprochement : `cash_register_summary` et `submit_cash_reconciliation` (idempotent).
@@ -55,6 +55,13 @@ L'application mobile n'a aucun moyen de confirmer un paiement : la réponse de l
 - **Doublons** : index unique `(recipient_id, payment_id)` ; une relance réseau ne recrée ni paiement (clé d'idempotence) ni notification.
 - **Fiabilité** : un incident de notification est tracé (`audit_logs`, `notification.failed`) sans annuler la confirmation du paiement.
 - **Lecture** : RLS `notifications_read_own` inchangée ; `payment_location` vérifie le périmètre avant d'ouvrir le paiement.
+
+## Notification d'une demande de paiement (migration 20261120000100)
+
+- **Création** : dans `record_collection_payment_request`, après l'enregistrement de la demande, pour chaque compte client actif lié au contribuable. Titre « Demande de paiement » ; corps : montant réel, mode prévu, date et heure dans le fuseau de l'organisation, et la mention que la demande sera marquée payée après confirmation.
+- **Nature** : colonne `notifications.kind` (`general`, `payment_requested`, `payment_confirmed`) ; index unique `(recipient_id, payment_id, kind)`. Une demande puis sa confirmation produisent deux notifications distinctes, jamais de doublon (relance avec la même clé : retour anticipé, aucune nouvelle notification).
+- **Fiabilité** : un incident est tracé (`notification.failed`, `kind = payment_requested`) sans annuler la demande.
+- **Retour au collecteur** : `payment_request_overview` indique le nombre de comptes réellement notifiés ; l'application affiche « aucune notification » si le client n'a pas de compte Terenza lié. Aucun envoi push n'est effectué (voir ci-dessous).
 
 ## Alerte sur le téléphone
 

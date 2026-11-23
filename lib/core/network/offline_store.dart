@@ -9,7 +9,17 @@ import 'package:sqflite/sqflite.dart';
 import 'package:sqflite/sqflite.dart' as sqflite;
 import 'package:uuid/uuid.dart';
 
-enum OutboxState { pending, syncing, retryable, needsAttention, synced }
+/// `dismissed` : opération refusée par le serveur puis close par l'utilisateur
+/// pour être corrigée et renvoyée. Rien n'a été enregistré côté serveur ; la
+/// ligne est conservée (sans contenu) pour l'historique local.
+enum OutboxState {
+  pending,
+  syncing,
+  retryable,
+  needsAttention,
+  synced,
+  dismissed,
+}
 
 class OfflineOperationAlreadyPending implements Exception {
   const OfflineOperationAlreadyPending();
@@ -81,25 +91,9 @@ class OfflineStore {
     final database = await selectedFactory.openDatabase(
       resolvedPath,
       options: sqflite.OpenDatabaseOptions(
-        version: 3,
+        version: 4,
         onCreate: (db, version) async {
-          await db.execute('''
-            CREATE TABLE sync_outbox (
-              id TEXT PRIMARY KEY,
-              owner_user_id TEXT NOT NULL,
-              operation_type TEXT NOT NULL,
-              resource_ref TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              state TEXT NOT NULL CHECK (state IN ('pending', 'syncing', 'retryable', 'needsAttention', 'synced')),
-              attempts INTEGER NOT NULL DEFAULT 0,
-              next_attempt_at TEXT,
-              technical_error TEXT,
-              idempotency_key TEXT NOT NULL UNIQUE,
-              payload_ciphertext BLOB NOT NULL,
-              payload_nonce BLOB NOT NULL,
-              payload_mac BLOB NOT NULL
-            )
-          ''');
+          await _createOutbox(db, 'sync_outbox');
           await db.execute(
             'CREATE INDEX sync_outbox_queue_idx ON sync_outbox(state, created_at)',
           );
@@ -142,6 +136,31 @@ class OfflineStore {
               'ALTER TABLE sync_outbox ADD COLUMN next_attempt_at TEXT',
             );
           }
+          if (oldVersion < 4) {
+            // Nouvel état `dismissed` : SQLite ne modifie pas une contrainte
+            // CHECK, la table est reconstruite. Toutes les lignes sont
+            // copiées ; onUpgrade s'exécute dans une transaction, un échec
+            // laisse la base intacte.
+            await _createOutbox(db, 'sync_outbox_v4');
+            await db.execute('''
+              INSERT INTO sync_outbox_v4 (
+                id, owner_user_id, operation_type, resource_ref, created_at, state,
+                attempts, next_attempt_at, technical_error, idempotency_key,
+                payload_ciphertext, payload_nonce, payload_mac
+              )
+              SELECT id, owner_user_id, operation_type, resource_ref, created_at, state,
+                attempts, next_attempt_at, technical_error, idempotency_key,
+                payload_ciphertext, payload_nonce, payload_mac
+              FROM sync_outbox
+            ''');
+            await db.execute('DROP TABLE sync_outbox');
+            await db.execute(
+              'ALTER TABLE sync_outbox_v4 RENAME TO sync_outbox',
+            );
+            await db.execute(
+              'CREATE INDEX sync_outbox_queue_idx ON sync_outbox(state, created_at)',
+            );
+          }
         },
         onOpen: (db) async {
           await db.update(
@@ -163,6 +182,27 @@ class OfflineStore {
     await store._encryptionKey();
     return store;
   }
+
+  static Future<void> _createOutbox(
+    sqflite.DatabaseExecutor db,
+    String table,
+  ) => db.execute('''
+    CREATE TABLE $table (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      operation_type TEXT NOT NULL,
+      resource_ref TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('pending', 'syncing', 'retryable', 'needsAttention', 'synced', 'dismissed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      technical_error TEXT,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      payload_ciphertext BLOB NOT NULL,
+      payload_nonce BLOB NOT NULL,
+      payload_mac BLOB NOT NULL
+    )
+  ''');
 
   Future<String> enqueue({
     required String ownerUserId,
@@ -361,6 +401,21 @@ class OfflineStore {
     required String technicalError,
   }) async {
     await _updateState(id, OutboxState.needsAttention, technicalError);
+  }
+
+  /// Clôt une opération que le serveur a définitivement refusée
+  /// (`needsAttention`), pour que l'utilisateur puisse la corriger et la
+  /// renvoyer. Sans effet sur une opération dans un autre état ou d'un autre
+  /// utilisateur. Renvoie `true` si l'opération a été close.
+  Future<bool> dismissRejected(String id, {required String ownerUserId}) async {
+    final clearedPayload = await _encrypt('{}');
+    final updated = await _database.update(
+      'sync_outbox',
+      {'state': OutboxState.dismissed.name, ...clearedPayload},
+      where: 'id = ? AND owner_user_id = ? AND state = ?',
+      whereArgs: [id, ownerUserId, OutboxState.needsAttention.name],
+    );
+    return updated == 1;
   }
 
   Future<void> markSynced(String id, {String? serverReference}) async {

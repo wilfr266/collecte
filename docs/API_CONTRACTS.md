@@ -11,7 +11,9 @@ RPC préparées par les migrations :
 - `confirm_cash_payment(payment_id)` : transaction du caissier affecté à une caisse ouverte; crée mouvement et reçu.
 - `confirm_external_payment_verified(payment_id, provider, provider_reference, amount, currency_code)` : `service_role` seulement (remplace `confirm_external_payment`, désormais non exécutable), après vérification du webhook par un serveur de confiance.
 - `void_receipt(receipt_id, reason)` : annulation avec motif et audit.
-- `record_collection_payment_request(assignment_id, establishment_id, obligation_id, amount, method, idempotency_key, notes)` : visite, obligation associée et paiement pending dans une transaction atomique.
+- `record_collection_payment_request(assignment_id, establishment_id, obligation_id, amount, method, idempotency_key, notes)` : visite, obligation associée et paiement pending dans une transaction atomique. Depuis 20261120000100, `obligation_id` est facultatif : sans échéance, la demande est rattachée à l'obligation « Encaissement » du jour (comme `record_field_payment`) ; les comptes clients liés reçoivent une notification `payment_requested`.
+- `payment_request_overview(payment_id)` : statut réel, client et nombre de comptes clients notifiés d'une demande ; réservé au collecteur déclarant et à `finance.read`.
+- `payments_page(..., p_min_amount, p_max_amount)` : filtre par montant ; `total_confirmed_amount` et `total_pending_amount` portent sur toute la sélection filtrée.
 - `start_appointment(appointment_id)`, `finish_appointment(appointment_id, result, notes)`, `reschedule_appointment(appointment_id, new_starts_at, reason)` : transitions réservées au collecteur affecté et auditées.
 - `cash_register_summary(cash_register_id)` : soldes calculés côté serveur pour une caisse accessible.
 - `submit_cash_reconciliation(cash_register_id, counted_amount, idempotency_key, notes)` : rapprochement et journalisation atomiques.

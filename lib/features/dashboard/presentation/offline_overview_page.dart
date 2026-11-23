@@ -185,15 +185,19 @@ String _queueState(OutboxState state) => switch (state) {
   OutboxState.retryable => 'Nouvel essai programmé',
   OutboxState.needsAttention => 'Intervention requise',
   OutboxState.synced => 'Synchronisée',
+  OutboxState.dismissed => 'Refusée puis corrigée',
 };
 
 /// Motif lisible d'une opération bloquée ; le code technique reste dans la
-/// base locale pour le diagnostic.
+/// base locale pour le diagnostic. Le gestionnaire de synchronisation stocke
+/// les codes « sûrs » (`duplicate_or_idempotency_conflict`…), d'où les deux
+/// formes acceptées.
 String blockedOperationReason(String? code) => switch (code) {
   'retry_limit_reached' => 'Envoi impossible après plusieurs essais',
-  '23505' => 'Opération déjà enregistrée',
-  '42501' => 'Opération non autorisée pour votre compte',
-  '22023' => 'Informations à vérifier',
+  '23505' ||
+  'duplicate_or_idempotency_conflict' => 'Opération déjà enregistrée',
+  '42501' || 'permission_denied' => 'Opération non autorisée pour votre compte',
+  '22023' || 'server_validation_conflict' => 'Informations à vérifier',
   'network_or_server_unavailable' => 'Réseau indisponible',
   _ => 'Opération à vérifier',
 };

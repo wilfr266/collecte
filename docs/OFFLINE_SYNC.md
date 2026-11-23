@@ -21,7 +21,7 @@ Cette protection ne résiste pas à un appareil compromis, déverrouillé, root�
 
 ## Outbox et reprise
 
-Chaque opération possède UUID local, propriétaire Auth, type, ressource, date, état, tentatives, erreur technique bornée et clé d'idempotence UUID. Le payload est chiffré. Les états sont `pending`, `syncing`, `retryable`, `needsAttention`, `synced`.
+Chaque opération possède UUID local, propriétaire Auth, type, ressource, date, état, tentatives, erreur technique bornée et clé d'idempotence UUID. Le payload est chiffré. Les états sont `pending`, `syncing`, `retryable`, `needsAttention`, `synced`, `dismissed` (schéma local v4). `dismissed` : opération refusée définitivement par le serveur (permission, validation, doublon) puis close depuis l'écran Nouvelle visite pour être corrigée ; rien n'existe côté serveur, la ligne est conservée sans contenu. Une opération en limite de tentatives n'est jamais close automatiquement (le serveur peut l'avoir reçue).
 
 La mise en file locale précède toute requête. Au retour du réseau, au retour au premier plan ou sur demande de l'utilisateur, le client appelle les RPC Supabase. Les visites seules utilisent `record_offline_visit`; les demandes financières utilisent `record_collection_payment_request` ou sa variante GPS. SQLite réinitialise un état `syncing` abandonné à `retryable` au prochain démarrage.
 

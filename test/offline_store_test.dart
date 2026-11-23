@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
@@ -75,6 +76,128 @@ void main() {
     expect(otherOwnerQueue, isEmpty);
     await reopenedStore.close();
   });
+
+  test('upgrading a v3 device keeps every queued operation', () async {
+    final legacy = await databaseFactoryFfi.openDatabase(
+      databasePath,
+      options: OpenDatabaseOptions(
+        version: 3,
+        onCreate: (db, _) async {
+          await db.execute('''
+            CREATE TABLE sync_outbox (
+              id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, operation_type TEXT NOT NULL,
+              resource_ref TEXT NOT NULL, created_at TEXT NOT NULL,
+              state TEXT NOT NULL CHECK (state IN ('pending', 'syncing', 'retryable', 'needsAttention', 'synced')),
+              attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, technical_error TEXT,
+              idempotency_key TEXT NOT NULL UNIQUE, payload_ciphertext BLOB NOT NULL,
+              payload_nonce BLOB NOT NULL, payload_mac BLOB NOT NULL)
+          ''');
+          await db.execute(
+            'CREATE INDEX sync_outbox_queue_idx ON sync_outbox(state, created_at)',
+          );
+          await db.execute('''
+            CREATE TABLE offline_cache (category TEXT NOT NULL, record_id TEXT NOT NULL,
+              organization_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, fetched_at TEXT NOT NULL,
+              payload_ciphertext BLOB NOT NULL, payload_nonce BLOB NOT NULL,
+              payload_mac BLOB NOT NULL, PRIMARY KEY(category, record_id))
+          ''');
+          await db.execute(
+            'CREATE TABLE sync_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+          );
+        },
+      ),
+    );
+    await legacy.insert('sync_outbox', {
+      'id': 'legacy-operation',
+      'owner_user_id': 'collector-a',
+      'operation_type': 'collection_payment_request',
+      'resource_ref': 'obligation-a',
+      'created_at': '2026-11-01T08:00:00Z',
+      'state': 'retryable',
+      'attempts': 2,
+      'idempotency_key': 'legacy-idempotency-key',
+      'payload_ciphertext': Uint8List.fromList([1, 2, 3]),
+      'payload_nonce': Uint8List.fromList([4, 5, 6]),
+      'payload_mac': Uint8List.fromList([7, 8, 9]),
+    });
+    await legacy.close();
+
+    final store = await OfflineStore.open(
+      factory: databaseFactoryFfi,
+      databasePath: databasePath,
+      keyStore: keyStore,
+    );
+    await store.close();
+
+    final upgraded = await databaseFactoryFfi.openDatabase(databasePath);
+    expect(await upgraded.getVersion(), 4);
+    final rows = await upgraded.query('sync_outbox');
+    expect(rows, hasLength(1));
+    expect(rows.single['state'], 'retryable');
+    expect(rows.single['attempts'], 2);
+    expect(rows.single['idempotency_key'], 'legacy-idempotency-key');
+    expect(rows.single['payload_ciphertext'], [1, 2, 3]);
+    await upgraded.update('sync_outbox', {'state': 'dismissed'});
+    await upgraded.close();
+  });
+
+  test(
+    'a server-refused request can be dismissed, then corrected and resent',
+    () async {
+      final store = await OfflineStore.open(
+        factory: databaseFactoryFfi,
+        databasePath: databasePath,
+        keyStore: keyStore,
+      );
+      Future<String> enqueue(String key) => store.enqueue(
+        ownerUserId: 'collector-a',
+        operationType: 'collection_payment_request',
+        resourceRef: 'payment:establishment-a',
+        idempotencyKey: key,
+        payload: const {'amount': 5000, 'method': 'cash'},
+      );
+      final refusedId = await enqueue('refused-request-key-1');
+      await store.markNeedsAttention(
+        refusedId,
+        technicalError: 'server_validation_conflict',
+      );
+
+      // Tant qu'elle n'est pas close, la demande bloquée empêche un doublon.
+      await expectLater(
+        enqueue('corrected-request-key'),
+        throwsA(isA<OfflineOperationAlreadyPending>()),
+      );
+      // Ni un autre utilisateur ni une opération non refusée ne se ferment.
+      expect(
+        await store.dismissRejected(refusedId, ownerUserId: 'collector-b'),
+        isFalse,
+      );
+
+      expect(
+        await store.dismissRejected(refusedId, ownerUserId: 'collector-a'),
+        isTrue,
+      );
+      final dismissed = await store.operationById(
+        refusedId,
+        ownerUserId: 'collector-a',
+      );
+      expect(dismissed?.state, OutboxState.dismissed);
+      expect(dismissed?.payload, isEmpty);
+      expect(await store.pendingCount(ownerUserId: 'collector-a'), 0);
+      expect(await store.needsAttentionCount(ownerUserId: 'collector-a'), 0);
+
+      final correctedId = await enqueue('corrected-request-key');
+      expect(
+        (await store.queuedOperations(ownerUserId: 'collector-a')).single.id,
+        correctedId,
+      );
+      expect(
+        await store.dismissRejected(correctedId, ownerUserId: 'collector-a'),
+        isFalse,
+      );
+      await store.close();
+    },
+  );
 
   test('encrypted payload is not written as plaintext into SQLite', () async {
     final store = await OfflineStore.open(
